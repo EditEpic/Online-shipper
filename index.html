@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Online-Shipper - Digital Payment Store</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet">
+    <style>
+        /* Custom styles for the high-energy theme */
+        :root {
+            --neon-blue: #00FFFF;
+            --dark-bg: #111827;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--dark-bg);
+            color: #f3f4f6;
+            scroll-behavior: smooth;
+        }
+        .neon-text-shadow {
+            text-shadow: 0 0 5px var(--neon-blue), 0 0 10px var(--neon-blue);
+        }
+        .product-card {
+            transition: transform 0.2s, box-shadow 0.2s;
+            background: #1f2937;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            height: 100%;
+            cursor: pointer;
+        }
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0, 255, 255, 0.2);
+        }
+        .badge {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 4px 10px;
+            font-weight: 800;
+            font-size: 0.8rem;
+            border-radius: 9999px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.4);
+            transform: rotate(5deg);
+        }
+        .view { display: none; }
+        .view.active { display: block; }
+
+        /* Google Pay Style simulation */
+        .gpay-button {
+            background-color: #4285F4; /* Google Blue */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: white;
+            border-radius: 0.5rem;
+            transition: background-color 0.2s;
+        }
+        .gpay-button:hover {
+            background-color: #357ae8;
+        }
+        .gpay-logo {
+            width: 32px;
+            height: 32px;
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setDoc, runTransaction, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Firebase global variables
+        window.db = null;
+        window.auth = null;
+        window.userId = null;
+        window.isAuthReady = false;
+        window.cartItems = [];
+        window.APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-online-shipper';
+        window.SUBTOTAL = 0; // Global variable to hold calculated subtotal
+        
+        setLogLevel('debug');
+
+        // --- 1. Initialization and Authentication ---
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const app = initializeApp(firebaseConfig);
+        window.db = getFirestore(app);
+        window.auth = getAuth(app);
+        
+        onAuthStateChanged(window.auth, async (user) => {
+            if (user) {
+                window.userId = user.uid;
+            } else {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(window.auth, __initial_auth_token);
+                        window.userId = window.auth.currentUser.uid;
+                    } else {
+                        const anonUser = await signInAnonymously(window.auth);
+                        window.userId = anonUser.user.uid;
+                    }
+                } catch (error) {
+                    console.error("Firebase Sign-in Error:", error);
+                }
+            }
+            window.isAuthReady = true;
+            console.log("Auth Ready. User ID:", window.userId);
+
+            if (window.userId) {
+                setupCartListener();
+            }
+        });
+
+        // --- 2. Cart Listener and UPI VPA Setup ---
+        function setupCartListener() {
+            const cartPath = `artifacts/${window.APP_ID}/users/${window.userId}/cart/items`;
+            const cartDocRef = doc(window.db, cartPath);
+
+            onSnapshot(cartDocRef, (docSnap) => {
+                if (docSnap.exists() && docSnap.data().items) {
+                    window.cartItems = docSnap.data().items;
+                } else {
+                    window.cartItems = [];
+                }
+                updateCartUI();
+                updateCartCount();
+                updatePaymentUI(); // Update checkout totals
+            }, (error) => {
+                console.error("Cart Listener Error:", error);
+            });
+        }
+        
+        // Expose functions to the global scope
+        window.addToCart = addToCart;
+        window.incrementItem = (id) => updateCartItemQuantity(id, 1);
+        window.decrementItem = (id) => updateCartItemQuantity(id, -1);
+        window.showView = showView;
+        window.showProductDetails = showProductDetails;
+        window.generateUPIPaymentLink = generateUPIPaymentLink;
+        
+        // --- 3. Firestore Cart Operations (Core logic for persistence) ---
+        async function addToCart(product) {
+            if (!window.isAuthReady || !window.userId) {
+                console.error("Firebase not ready. Cannot add to cart.");
+                return;
+            }
+            
+            const cartPath = `artifacts/${window.APP_ID}/users/${window.userId}/cart/items`;
+            const cartDocRef = doc(window.db, cartPath);
+
+            try {
+                await runTransaction(window.db, async (transaction) => {
+                    const docSnap = await transaction.get(cartDocRef);
+                    let items = docSnap.exists() && docSnap.data().items ? docSnap.data().items : [];
+                    
+                    const existingIndex = items.findIndex(item => item.id === product.id);
+
+                    if (existingIndex > -1) {
+                        items[existingIndex].quantity += 1;
+                    } else {
+                        items.push({
+                            id: product.id,
+                            name: product.name,
+                            price: product.price,
+                            image: product.image,
+                            quantity: 1
+                        });
+                    }
+
+                    transaction.set(cartDocRef, { items: items });
+                    
+                    // Show confirmation in shop/detail view
+                    const button = document.getElementById(`addToCartBtn-${product.id}`) || document.getElementById('productDetailCartBtn');
+                    if(button) {
+                        button.textContent = 'Added! View Cart →';
+                        button.classList.add('bg-green-600', 'hover:bg-green-500');
+                        setTimeout(() => {
+                             if(document.getElementById('shop-view').classList.contains('active') || document.getElementById('product-view').classList.contains('active')) {
+                                button.textContent = 'ADD TO CART';
+                                button.classList.remove('bg-green-600', 'hover:bg-green-500');
+                                button.classList.add('bg-red-600', 'hover:bg-red-500');
+                             }
+                        }, 1500);
+                    }
+                });
+            } catch (error) {
+                console.error("Transaction failed: ", error);
+            }
+        }
+        
+        async function updateCartItemQuantity(id, delta) {
+            if (!window.isAuthReady || !window.userId) return;
+
+            const cartPath = `artifacts/${window.APP_ID}/users/${window.userId}/cart/items`;
+            const cartDocRef = doc(window.db, cartPath);
+
+            try {
+                await runTransaction(window.db, async (transaction) => {
+                    const docSnap = await transaction.get(cartDocRef);
+                    let items = docSnap.exists() && docSnap.data().items ? docSnap.data().items : [];
+                    
+                    const existingIndex = items.findIndex(item => item.id === id);
+
+                    if (existingIndex > -1) {
+                        items[existingIndex].quantity += delta;
+                        
+                        if (items[existingIndex].quantity <= 0) {
+                            items.splice(existingIndex, 1);
+                        }
+                    }
+
+                    transaction.set(cartDocRef, { items: items });
+                });
+            } catch (error) {
+                console.error("Quantity transaction failed: ", error);
+            }
+        }
+        
+        async function completeOrder() {
+            if (!window.isAuthReady || !window.userId) return;
+            const cartPath = `artifacts/${window.APP_ID}/users/${window.userId}/cart/items`;
+            const cartDocRef = doc(window.db, cartPath);
+            
+            try {
+                await setDoc(cartDocRef, { items: [] });
+                console.log("Cart cleared after order completion.");
+            } catch (error) {
+                console.error("Failed to clear cart:", error);
+            }
+        }
+
+
+        // Dummy product data (Prices in INR)
+        window.PRODUCTS = [
+            { id: 'rc_car_x300', name: 'QUANTUM DRIFTER X300', price: 9599.00, salePrice: 15999.00, desc: 'Next-Gen Brushless Power', image: 'https://placehold.co/600x400/000/fff?text=RC+DRIFTER+%F0%9F%9A%98', badge: 'HOT ITEM', details: 'Unleash the speed with the X300’s all-wheel drive and high-torque motor. Features 2.4GHz remote control and durable chassis built for intense drifts. Includes fast charger and extra set of tires.', stock: 5 },
+            { id: 'gaming_headset_hzpro', name: 'APEX AUDIO HZ PRO', price: 6000.00, salePrice: 12000.00, desc: '7.1 Surround Sound Dominance', image: 'https://placehold.co/600x400/000/fff?text=GAMING+HEADSET+%F0%9F%8E%A7', badge: 'SAVE 50%', details: 'Experience crystal-clear positional audio with 50mm neodymium drivers. The HZ PRO features a noise-canceling mic and plush, breathable ear cups for marathon gaming sessions. USB and 3.5mm compatible.', stock: 12 },
+            { id: 'smart_watch_v4', name: 'TITAN TRACKER V4', price: 11920.00, salePrice: 19999.00, desc: 'Military Grade Durability', image: 'https://placehold.co/600x400/000/fff?text=PERFORMANCE+WATCH+%E2%8F%B1', badge: 'BEST SELLER', details: 'Built to withstand extreme conditions, the V4 tracks heart rate, sleep, and 100+ sports modes. Features a ruggedized display and a battery life of up to 14 days on a single charge. Waterproof up to 50m.', stock: 3 }
+        ];
+
+        // --- 4. UI Update Functions ---
+        
+        function formatPrice(amount) {
+            return `₹${amount.toFixed(2)}`;
+        }
+        
+        function updateCartUI() {
+            const cartContainer = document.getElementById('cartItems');
+            const cartTotalElement = document.getElementById('cartTotal');
+            let subtotal = 0;
+            let cartHtml = '';
+
+            if (window.cartItems.length === 0) {
+                cartHtml = '<p class="text-gray-400 text-center py-8">Your cart is empty! Time to check out the amazing deals in the shop.</p>';
+            } else {
+                cartHtml = window.cartItems.map(item => {
+                    const itemTotal = item.price * item.quantity;
+                    subtotal += itemTotal;
+                    
+                    return `
+                        <div class="flex items-center space-x-4 border-b border-gray-700 py-4">
+                            <img src="${item.image}" alt="${item.name}" class="w-16 h-16 object-cover rounded-md border-2 border-cyan-500/50">
+                            <div class="flex-grow">
+                                <p class="font-bold text-white">${item.name}</p>
+                                <p class="text-sm text-gray-400">${formatPrice(item.price)} each</p>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <button onclick="window.decrementItem('${item.id}')" class="bg-gray-700 text-white p-1 rounded-full w-6 h-6 flex items-center justify-center hover:bg-red-600 transition">-</button>
+                                <span class="font-bold w-4 text-center">${item.quantity}</span>
+                                <button onclick="window.incrementItem('${item.id}')" class="bg-gray-700 text-white p-1 rounded-full w-6 h-6 flex items-center justify-center hover:bg-green-600 transition">+</button>
+                            </div>
+                            <div class="font-extrabold text-cyan-400 w-20 text-right">
+                                ${formatPrice(itemTotal)}
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            }
+            
+            window.SUBTOTAL = subtotal; // Store global subtotal
+            cartContainer.innerHTML = cartHtml;
+            cartTotalElement.textContent = formatPrice(subtotal);
+            
+            const checkoutButton = document.getElementById('goToCheckoutButton');
+            if (subtotal > 0) {
+                checkoutButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                checkoutButton.disabled = false;
+            } else {
+                checkoutButton.classList.add('opacity-50', 'cursor-not-allowed');
+                checkoutButton.disabled = true;
+            }
+        }
+
+        function updateCartCount() {
+            const totalQuantity = window.cartItems.reduce((sum, item) => sum + item.quantity, 0);
+            document.getElementById('cartCount').textContent = `(${totalQuantity})`;
+        }
+        
+        function updatePaymentUI() {
+            const total = window.SUBTOTAL;
+            document.getElementById('checkoutTotalDisplay').textContent = formatPrice(total);
+            
+            const paymentButton = document.getElementById('gpayPaymentButton');
+            if (total > 0) {
+                 paymentButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                 paymentButton.disabled = false;
+            } else {
+                paymentButton.classList.add('opacity-50', 'cursor-not-allowed');
+                paymentButton.disabled = true;
+            }
+        }
+        
+        // --- 5. View Switching and Product Detail Logic ---
+        function showView(viewId) {
+            document.querySelectorAll('.view').forEach(view => {
+                view.classList.remove('active');
+            });
+            document.getElementById(viewId).classList.add('active');
+            window.scrollTo(0, 0);
+            
+            // Clear checkout message when navigating away
+            document.getElementById('checkoutMessageBox').classList.add('hidden');
+        }
+        
+        function showProductDetails(productId) {
+            const product = window.PRODUCTS.find(p => p.id === productId);
+            if (!product) return;
+
+            document.getElementById('productDetailImage').src = product.image;
+            document.getElementById('productDetailTitle').textContent = product.name;
+            document.getElementById('productDetailPrice').textContent = formatPrice(product.price);
+            document.getElementById('productDetailSalePrice').innerHTML = `<span class="line-through text-gray-500 text-xl mr-3">${formatPrice(product.salePrice)}</span>`;
+            document.getElementById('productDetailDescription').textContent = product.details;
+            document.getElementById('productDetailStock').textContent = product.stock > 0 ? `In Stock: ${product.stock} units` : 'Out of Stock';
+            
+            // Setup the specific product for the cart button
+            const detailBtn = document.getElementById('productDetailCartBtn');
+            detailBtn.onclick = () => window.addToCart(product);
+            
+            // Reset button text just in case user added it from shop view
+            detailBtn.textContent = 'ADD TO CART';
+            detailBtn.classList.
+
+      
